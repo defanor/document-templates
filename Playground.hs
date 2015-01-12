@@ -1,3 +1,5 @@
+-- http://defanor.uberspace.net/notes/document-templates.html
+
 import Control.Monad.Except
 import Data.List
 import qualified Data.Foldable as DF
@@ -89,12 +91,17 @@ findVar (Env r) s =
 
 nf :: Expr -> Expr
 nf ee = spine ee []
-  where spine (App f a) as = spine f (a:as)
-        spine (Lam s t e) [] = Lam s (nf t) (nf e)
-        spine (Lam s _ e) (a:as) = spine (subst s a e) as
-        spine (Pi ii tm s k t) as = app (Pi ii tm s (nf k) (nf t)) as
-        spine f as = app f as
-        app f as = foldl App f (map nf as)
+  where
+    -- a hack, but only need this one function for now
+    spine (App (Var "pred") n) as = case n of
+      (App (Var "LS") m) -> m
+      _ -> (Var "LZ")
+    spine (App f a) as = spine f (a:as)
+    spine (Lam s t e) [] = Lam s (nf t) (nf e)
+    spine (Lam s _ e) (a:as) = spine (subst s a e) as
+    spine (Pi ii tm s k t) as = app (Pi ii tm s (nf k) (nf t)) as
+    spine f as = app f as
+    app f as = foldl App f (map nf as)
 
 whnf :: Expr -> Expr
 whnf ee = spine ee []
@@ -128,7 +135,7 @@ tCheck r (App f a) = do
         unless (betaEq ta at) $ throwError $ "Bad function argument type: expected " ++
           printExpr at ++ ", got " ++ printExpr ta
         return $ subst x a rt
-     other -> throwError $ "Non-function in application: " ++ (show other)
+     other -> throwError $ "Non-function in application: " ++ (show other) ++ "(" ++ printExpr f ++ ")"
 tCheck r (Lam s t e) = do
     tCheck r t
     let r' = extend s t "" r
@@ -191,10 +198,38 @@ addDecls = DF.foldrM (flip addDecl)
 
 primEnv :: Env
 primEnv = Env [("String", ((Kind Star), "(String)")),
-               ("Int", ((Kind Star), "(Int)"))]
+               ("Int", ((Kind Star), "(Int)")),
+               ("pred", ((Pi False "pred1" "n" (Var "LNat") (Var "LNat")), "<pred>"))]
 
 basicEnv :: TC Env
-basicEnv = addDecls primEnv [("Nat", (Kind Star,
+basicEnv = addDecls primEnv [("Test", (Pi False "test1" "n" (Var "LNat") (Kind Star),
+                                       [("MkTest", Pi True "mktest1" "n" (Var "LNat")
+                                                   (App (Var "Test") (Var "n")),
+                                         "CMkTest"),
+                                        ("MkTest2", Pi True "mktest2.1" "n" (Var "LNat")
+                                                    (Pi False "mktest2.2" "m"
+                                                     (App (Var "Test") (App (Var "pred") (Var "n")))
+                                                    (App (Var "Test") (Var "n"))),
+                                         "CMkTest2")])),
+                             ("LazyList", (Pi False "list1" "x" (Kind Star)
+                                           (Pi False "list2" "n" (Var "LNat")
+                                            (Kind Star)),
+                                           [("LNil", Pi True "lnil1" "a" (Kind Star)
+                                                    (Pi True "lnil2" "n" (Var "LNat")
+                                                     (App (App (Var "LazyList") (Var "a")) (Var "n"))),
+                                             "CLNil"),
+                                            ("LCons", Pi True "lcons1" "a" (Kind Star)
+                                                      (Pi True "lnil2" "n" (Var "LNat")
+                                                       (Pi False "lcons2" "x" (Var "a")
+                                                        (Pi False "lcons3" "xs"
+                                                         (App (App (Var "LazyList") (Var "a"))
+                                                          (App (Var "pred") (Var "n")))
+                                                         (App (App (Var "LazyList") (Var "a")) (Var "n"))))),
+                                             "CLCons")])),
+                             ("LNat", (Kind Star,
+                                      [("LZ", Var "LNat", "CLZ"),
+                                       ("LS", Pi False "ls1" "x" (Var "LNat") (Var "LNat"), "CLS")])),
+                             ("Nat", (Kind Star,
                                       [("Z", Var "Nat", "CZ"),
                                        ("S", Pi False "s1" "x" (Var "Nat") (Var "Nat"), "CS")])),
                              ("IntList", (Kind Star,
@@ -326,11 +361,7 @@ solveImplicits env (App e1 e2) t
     -- implicits on the left: solve them, then try again, passing type
     woImpl <- solveImplicits env e1 t
     t1 <- tCheck env woImpl
-    case t1 of
-      (Pi _ _ _ l1 _) -> do
-        woImpl2 <- solveImplicits env e2 l1
-        return $ App woImpl woImpl2
-      _ -> throwError $ "wtf " ++ printExpr t1 ++ "/" ++ printExpr e1
+    solveImplicits env (App woImpl e2) t
   | e2 == Implicit = do
     t1 <- tCheck env e1
     case t1 of
@@ -368,7 +399,9 @@ requiresImplicit env e = do
 ensureImplicit :: Env -> Expr -> TC Expr
 ensureImplicit env e = do
   er <- requiresImplicit env e
-  return $ if er then (App e Implicit) else e
+  if er
+    then ensureImplicit env (App e Implicit)
+    else return e
 
 insertImplicits :: Env -> Expr -> TC Expr
 insertImplicits env (App e1 e2) = do
@@ -396,5 +429,26 @@ intList' = (App (App (Var "Cons") (Prim (PInt 1)))
                   (App (App (Var "Cons") (Prim (PInt 8)))
                    (Var "Nil")))))))))
 
+intLazyList :: Expr
+intLazyList = (App (App (Var "LCons") (Prim (PInt 1)))
+               (App (App (Var "LCons") (Prim (PInt 2)))
+                (App (App (Var "LCons") (Prim (PInt 3)))
+                 (App (App (Var "LCons") (Prim (PInt 4)))
+                  (App (App (Var "LCons") (Prim (PInt 5)))
+                   (App (App (Var "LCons") (Prim (PInt 6)))
+                    (App (App (Var "LCons") (Prim (PInt 7)))
+                     (App (App (Var "LCons") (Prim (PInt 8)))
+                      (Var "LNil")))))))))
+
+illTest :: TC String
+illTest = do
+   env <- basicEnv
+   expr <- insAndSolveImpl env intLazyList (App (App (Var "List") (Var "Int"))
+                                            (App (Var "LS") (App (Var "LS") (Var "LZ"))))
+   render env (nf expr) Nothing
+
 -- do; env <- basicEnv; expr <- insAndSolveImpl env intList' (App (Var "List") (Var "Int")); render env expr Nothing
+
+-- do; env <- basicEnv; expr <- insAndSolveImpl env (Var "MkTest2") (App (Var "Test") (App (Var "LS") (App (Var "LS") (Var "LZ")))); t <- tCheck env expr; return $ printExpr (nf t)
+
 
