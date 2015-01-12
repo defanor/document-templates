@@ -321,6 +321,29 @@ render r@(Env env) e@(App e1 e2) delayIn = do
           return $ "(" ++ re1 ++ " " ++ re2 ++ " " ++ tm ++ ")"
 render r v _ = return $ printExpr v
 
+render' :: Env -> Expr -> TC String
+render' r@(Env env) (Var v) = return $ snd (fromJust $ lookup v env)
+render' r (App e1 e2) = do
+  t1 <- tCheck r e1
+  t2 <- tCheck r e2
+  case t1 of
+    Pi ii tm x at rt -> do
+      re1 <- render' r e1
+      re2 <- case (ii, hasZero t2) of
+        (_, True) -> return $ "[delayed]"
+        (True, _) -> do
+          v <- render' r e2
+          return $ "{" ++ v ++ "}"
+        _ -> render' r e2
+      return $ "(" ++ re1 ++ " " ++ re2 ++ " " ++ tm ++ ")"
+  where
+    hasZero (Var "LZ") = True
+    hasZero (App (Var "LS") e2) = False
+    hasZero (App e1 e2) = hasZero e1 || hasZero e2
+    hasZero _ = False
+render' r v = return $ printExpr v
+
+
 -- implicits: not a nice approach here, but will work for now (for
 -- those basic datatypes, that is)
 
@@ -445,7 +468,7 @@ illTest = do
    env <- basicEnv
    expr <- insAndSolveImpl env intLazyList (App (App (Var "List") (Var "Int"))
                                             (App (Var "LS") (App (Var "LS") (Var "LZ"))))
-   render env (nf expr) Nothing
+   render' env (nf expr)
 
 -- do; env <- basicEnv; expr <- insAndSolveImpl env intList' (App (Var "List") (Var "Int")); render env expr Nothing
 
