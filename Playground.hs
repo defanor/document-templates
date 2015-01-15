@@ -5,6 +5,7 @@ import Data.List
 import qualified Data.Foldable as DF
 import Data.Maybe
 import Control.Applicative
+import Control.Monad
 
 -- http://augustss.blogspot.ru/2007/10/simpler-easier-in-recent-paper-simply.html
 
@@ -13,8 +14,8 @@ type Template = String
 type IsImplicit = Bool
 
 
--- might be nice to move things like Implicit, Delay, and additional
--- Pi args to a separate AST later; perhaps when will map it all to a
+-- might be nice to move things like Implicit and additional Pi args
+-- to a separate AST later; perhaps when will map it all to a
 -- map/database
 data Expr
     = Var Sym
@@ -23,7 +24,6 @@ data Expr
     | Pi IsImplicit Template Sym Type Type
     | Kind Kinds
     | Prim Prims
-    | Delay Int Expr
     | Implicit
     deriving (Eq, Read, Show)
 type Type = Expr
@@ -55,7 +55,6 @@ freeVars (Lam i t e) = freeVars t `union` (freeVars e \\ [i])
 freeVars (Pi _ _ i k t) = freeVars k `union` (freeVars t \\ [i])
 freeVars (Kind _) = []
 freeVars (Prim _) = []
-freeVars (Delay n e) = freeVars e
 
 subst :: Sym -> Expr -> Expr -> Expr
 subst v x = sub
@@ -65,20 +64,16 @@ subst v x = sub
         sub (Pi ii tm i t e) = abstr (Pi ii tm) i t e
         sub (Kind k) = Kind k
         sub (Prim x) = Prim x
-        sub (Delay n x) = Delay n (sub x)
         fvx = freeVars x
         cloneSym e i = loop i
            where loop i' = if i' `elem` vars then loop (i ++ "'") else i'
                  vars = fvx ++ freeVars e
-        abstr con i t e =
-            if v == i then
-                con i (sub t) e
-            else if i `elem` fvx then
-                let i' = cloneSym e i
-                    e' = substVar i i' e
-                in  con i' (sub t) (sub e')
-            else
-                con i (sub t) (sub e)
+        abstr con i t e
+          | v == i = con i (sub t) e
+          | i `elem` fvx = let i' = cloneSym e i
+                               e' = substVar i i' e
+                           in  con i' (sub t) (sub e')
+          | otherwise = con i (sub t) (sub e)
 
 substVar :: Sym -> Sym -> Expr -> Expr
 substVar s s' = subst s (Var s')
@@ -93,9 +88,9 @@ nf :: Expr -> Expr
 nf ee = spine ee []
   where
     -- a hack, but only need this one function for now
-    spine (App (Var "pred") n) as = case n of
+    spine (App (Var "pred") n) _ = case n of
       (App (Var "LS") m) -> m
-      _ -> (Var "LZ")
+      _ -> Var "LZ"
     spine (App f a) as = spine f (a:as)
     spine (Lam s t e) [] = Lam s (nf t) (nf e)
     spine (Lam s _ e) (a:as) = spine (subst s a e) as
@@ -115,8 +110,6 @@ alphaEq (App f a) (App f' a') = alphaEq f f' && alphaEq a a'
 alphaEq (Lam s t1 e) (Lam s' t2 e') = t1 == t2 && alphaEq e (substVar s' s e')
 alphaEq (Pi _ _ s t1 e) (Pi _ _ s' t2 e') = t1 == t2 && alphaEq e (substVar s' s e')
 alphaEq (Kind x) (Kind y) = x == y
-alphaEq (Delay n x) y = alphaEq x y
-alphaEq x (Delay n y) = alphaEq x y
 alphaEq _ _ = False
 
 betaEq :: Expr -> Expr -> Bool
@@ -124,7 +117,6 @@ betaEq e1 e2 = alphaEq (nf e1) (nf e2)
 
 tCheck :: Env -> Expr -> TC Type
 tCheck r (Prim p) = return $ Var (primType p)
-tCheck r (Delay n e) = tCheck r e
 tCheck r (Var s) =
     findVar r s
 tCheck r (App f a) = do
@@ -135,7 +127,7 @@ tCheck r (App f a) = do
         unless (betaEq ta at) $ throwError $ "Bad function argument type: expected " ++
           printExpr at ++ ", got " ++ printExpr ta
         return $ subst x a rt
-     other -> throwError $ "Non-function in application: " ++ (show other) ++ "(" ++ printExpr f ++ ")"
+     other -> throwError $ "Non-function in application: " ++ show other ++ "(" ++ printExpr f ++ ")"
 tCheck r (Lam s t e) = do
     tCheck r t
     let r' = extend s t "" r
@@ -166,9 +158,8 @@ target (App e _) = target e
 target e = e
 
 ensureTarget :: Type -> Type -> TC ()
-ensureTarget t ty = if target ty == t
-                    then return ()
-                    else throwError ("Wrong target: expected " ++ show t ++ ", got " ++ show (target ty))
+ensureTarget t ty = unless (target ty == t) $
+                    throwError ("Wrong target: expected " ++ show t ++ ", got " ++ show (target ty))
 
 -- type Program = (Env, Ctx)
 type Decl = (Type, [(Sym, Type, Template)])
@@ -191,27 +182,18 @@ addDecl env sd@(n, (t, cl)) = do
   _ <- checkConstructors env sd
   return $ foldr extend' (extend n t ("(" ++ n ++ ")") env) cl
   where
-    extend' (n, t, tmpl) env = extend n t tmpl env
+    extend' (n, t, tmpl) = extend n t tmpl
 
 addDecls :: Env -> [(Sym, Decl)] -> TC Env
 addDecls = DF.foldrM (flip addDecl)
 
 primEnv :: Env
-primEnv = Env [("String", ((Kind Star), "(String)")),
-               ("Int", ((Kind Star), "(Int)")),
-               ("pred", ((Pi False "pred1" "n" (Var "LNat") (Var "LNat")), "<pred>"))]
+primEnv = Env [("String", (Kind Star, "(String)")),
+               ("Int", (Kind Star, "(Int)")),
+               ("pred", (Pi False "pred1" "n" (Var "LNat") (Var "LNat"), "<pred>"))]
 
 basicEnv :: TC Env
-basicEnv = addDecls primEnv [("Test", (Pi False "test1" "n" (Var "LNat") (Kind Star),
-                                       [("MkTest", Pi True "mktest1" "n" (Var "LNat")
-                                                   (App (Var "Test") (Var "n")),
-                                         "CMkTest"),
-                                        ("MkTest2", Pi True "mktest2.1" "n" (Var "LNat")
-                                                    (Pi False "mktest2.2" "m"
-                                                     (App (Var "Test") (App (Var "pred") (Var "n")))
-                                                    (App (Var "Test") (Var "n"))),
-                                         "CMkTest2")])),
-                             ("LazyList", (Pi False "list1" "x" (Kind Star)
+basicEnv = addDecls primEnv [("LazyList", (Pi False "list1" "x" (Kind Star)
                                            (Pi False "list2" "n" (Var "LNat")
                                             (Kind Star)),
                                            [("LNil", Pi True "lnil1" "a" (Kind Star)
@@ -231,20 +213,7 @@ basicEnv = addDecls primEnv [("Test", (Pi False "test1" "n" (Var "LNat") (Kind S
                                        ("LS", Pi False "ls1" "x" (Var "LNat") (Var "LNat"), "CLS")])),
                              ("Nat", (Kind Star,
                                       [("Z", Var "Nat", "CZ"),
-                                       ("S", Pi False "s1" "x" (Var "Nat") (Var "Nat"), "CS")])),
-                             ("IntList", (Kind Star,
-                                          [("MkIntList", (Pi False "intList1" "x"
-                                                          (App (Var "List") (Var "Int"))
-                                                          (Var "IntList")), "CIntList")])),
-                             ("List", (Pi False "list1" "x" (Kind Star) (Kind Star),
-                                       [("Nil", Pi True "nil1" "a" (Kind Star) (App (Var "List") (Var "a")),
-                                         "CNil"),
-                                        ("Cons", Pi True "cons1" "a" (Kind Star)
-                                                 (Pi False "cons2" "x" (Var "a")
-                                                  (Pi False "cons3" "xs" (Delay 5 (App (Var "List") (Var "a")))
-                                                   (App (Var "List") (Var "a")))),
-                                         "CCons")]))
-                             ]
+                                       ("S", Pi False "s1" "x" (Var "Nat") (Var "Nat"), "CS")]))]
 
 check :: Env -> Expr -> TC Expr
 check env expr = do
@@ -255,23 +224,6 @@ check' :: Expr -> TC Type
 check' expr = do
   env <- basicEnv
   tCheck env expr
-
-natList :: Expr
-natList = (App (App (App (Var "Cons") (Var "Nat")) (Var "Z"))
-           (App (App (App (Var "Cons") (Var "Nat")) (App (Var "S") (Var "Z")))
-            (App (Var "Nil") (Var "Nat"))))
-
-intList :: Expr
-intList = (App (App (App (Var "Cons") (Var "Int")) (Prim (PInt 1)))
-           (App (App (App (Var "Cons") (Var "Int")) (Prim (PInt 2)))
-            (App (App (App (Var "Cons") (Var "Int")) (Prim (PInt 3)))
-             (App (App (App (Var "Cons") (Var "Int")) (Prim (PInt 4)))
-              (App (App (App (Var "Cons") (Var "Int")) (Prim (PInt 5)))
-               (App (App (App (Var "Cons") (Var "Int")) (Prim (PInt 6)))
-                (App (App (App (Var "Cons") (Var "Int")) (Prim (PInt 7)))
-                 (App (App (App (Var "Cons") (Var "Int")) (Prim (PInt 8)))
-                  (App (Var "Nil") (Var "Int"))))))))))
-
 
 -- print and render
 
@@ -285,64 +237,56 @@ printExpr (Kind Star) = "*"
 printExpr (Kind Box) = "[]"
 printExpr (Prim (PInt x)) = show x
 printExpr (Prim (PString x)) = show x
-printExpr (Delay n e) = show n ++ "-" ++ printExpr e
 printExpr Implicit = "_"
 
 
 isPi :: Type -> Bool
-isPi (Pi _ _ _ _ _) = True
+isPi Pi{} = True
 isPi _ = False
 
--- once there will be IDs, they should be used to move delay's focus,
--- replacing a shown part with some of originally delayed results
 
-render :: Env -> Expr -> Maybe Int -> TC String
-render r@(Env env) (Var v) _ = return $ snd (fromJust $ lookup v env)
-render r@(Env env) e@(App e1 e2) delayIn = do
-  t <- tCheck r e1
-  fullyApplied <- liftM (not . isPi) $ tCheck r e
-  case t of
-    Pi ii tm x at rt -> do
-      delayArg <- return $ case (at, delayIn) of
-        (Delay n _, Just m) -> Just $ min n (if fullyApplied then pred m else m)
-        (Delay n _, Nothing) -> Just $ n
-        (_, Just m) -> Just $ if fullyApplied then pred m else m
-        _ -> Nothing
-      case delayArg of
-        (Just 0) ->
-          return "[delayed]"
-        _ -> do
-          re1 <- render r e1 delayArg
-          re2 <- case ii of
-            True -> do
-              v <- render r e2 delayArg
-              return $ "{" ++ v ++ "}"
-            False -> render r e2 delayArg
-          return $ "(" ++ re1 ++ " " ++ re2 ++ " " ++ tm ++ ")"
-render r v _ = return $ printExpr v
-
-render' :: Env -> Expr -> TC String
-render' r@(Env env) (Var v) = return $ snd (fromJust $ lookup v env)
-render' r (App e1 e2) = do
+render :: Env -> Expr -> TC String
+render r@(Env env) (Var v) = return $ snd (fromJust $ lookup v env)
+render r (App e1 e2) = do
   t1 <- tCheck r e1
   t2 <- tCheck r e2
   case t1 of
     Pi ii tm x at rt -> do
-      re1 <- render' r e1
+      re1 <- render r e1
       re2 <- case (ii, hasZero t2) of
-        (_, True) -> return $ "[delayed]"
+        (_, True) -> return "[delayed]"
         (True, _) -> do
-          v <- render' r e2
+          v <- render r e2
           return $ "{" ++ v ++ "}"
-        _ -> render' r e2
+        _ -> render r e2
       return $ "(" ++ re1 ++ " " ++ re2 ++ " " ++ tm ++ ")"
   where
     hasZero (Var "LZ") = True
     hasZero (App (Var "LS") e2) = False
     hasZero (App e1 e2) = hasZero e1 || hasZero e2
     hasZero _ = False
-render' r v = return $ printExpr v
+render r v = return $ printExpr v
 
+data Direction = L | R
+
+findSub :: Expr -> [Direction] -> Expr
+findSub (App e1 e2) (L:xs) = findSub e1 xs
+findSub (App e1 e2) (R:xs) = findSub e2 xs
+findSub expr [] = expr
+
+
+renderSub :: Env -> Expr -> [Direction] -> Int -> TC String
+renderSub env expr d skip = do
+  t <- tCheck env (findSub expr d)
+  -- get type and value
+  -- then skip value * skip of that type constructors
+  -- then render
+
+  -- find LNat and type, remember
+  -- increase every LNat in that type
+  -- skip
+  -- render
+  render env (findSub expr d)
 
 -- implicits: not a nice approach here, but will work for now (for
 -- those basic datatypes, that is)
@@ -364,8 +308,7 @@ notShadowed s e = Just e
 
 -- sym -> constructor after implicit -> expected -> maybe value of that sym
 varInType :: Sym -> Type -> Type -> Maybe Expr
-varInType s e (Delay n expected) = varInType s e expected
-varInType s e expected = case (notShadowed s e) of
+varInType s e expected = case notShadowed s e of
   (Just result) -> findVar expected result
   where
     findVar :: Type -> Type -> Maybe Type
@@ -390,7 +333,7 @@ solveImplicits env (App e1 e2) t
     case t1 of
       (Pi _ _ ps pt pe) -> case varInType ps pe t of
         Nothing -> throwError $ "unable to solve implicit: " ++ ps ++ " in " ++ printExpr e1 ++ " of type " ++ printExpr t
-        (Just val) -> return $ (App e1 val)
+        (Just val) -> return $ App e1 val
   | otherwise = do
     -- no implicits on the left: solve implicits on the right, passing type
     t1 <- tCheck env e1
@@ -441,17 +384,6 @@ insAndSolveImpl env e t = do
   solveImplicits env wi t
 
 
-intList' :: Expr
-intList' = (App (App (Var "Cons") (Prim (PInt 1)))
-            (App (App (Var "Cons") (Prim (PInt 2)))
-             (App (App (Var "Cons") (Prim (PInt 3)))
-              (App (App (Var "Cons") (Prim (PInt 4)))
-               (App (App (Var "Cons") (Prim (PInt 5)))
-                (App (App (Var "Cons") (Prim (PInt 6)))
-                 (App (App (Var "Cons") (Prim (PInt 7)))
-                  (App (App (Var "Cons") (Prim (PInt 8)))
-                   (Var "Nil")))))))))
-
 intLazyList :: Expr
 intLazyList = (App (App (Var "LCons") (Prim (PInt 1)))
                (App (App (Var "LCons") (Prim (PInt 2)))
@@ -468,7 +400,7 @@ illTest = do
    env <- basicEnv
    expr <- insAndSolveImpl env intLazyList (App (App (Var "List") (Var "Int"))
                                             (App (Var "LS") (App (Var "LS") (Var "LZ"))))
-   render' env (nf expr)
+   render env (nf expr)
 
 -- do; env <- basicEnv; expr <- insAndSolveImpl env intList' (App (Var "List") (Var "Int")); render env expr Nothing
 
